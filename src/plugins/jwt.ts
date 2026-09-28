@@ -1,7 +1,8 @@
 import jwt from '@fastify/jwt';
 import fp from 'fastify-plugin';
 import type { PermissionCode } from '../domain/permission-codes';
-import { getAuthConfiguration } from '../config/auth';
+import { assertAuthConfiguration } from '../config/auth';
+import { getNetlifyProxySecret } from '../utils/clientIp';
 
 declare module '@fastify/jwt' {
   interface FastifyJWT {
@@ -24,11 +25,14 @@ declare module '@fastify/jwt' {
 }
 
 export default fp(async (fastify) => {
-  const secret = process.env.APP_JWT_SECRET;
-  if (!secret || secret.length < 32) {
-    throw new Error('APP_JWT_SECRET must contain at least 32 characters');
+  // Fails the boot on any missing or inconsistent auth setting.
+  const config = assertAuthConfiguration();
+  const secret = process.env.APP_JWT_SECRET as string;
+  // Behind Netlify every request arrives from a Netlify address; without the
+  // signature secret all users would share one rate-limit bucket.
+  if (!getNetlifyProxySecret() && process.env.NODE_ENV === 'production') {
+    throw new Error('NETLIFY_PROXY_SIGNATURE_SECRET is required in production (see client/netlify.toml)');
   }
-  const config = getAuthConfiguration();
 
   await fastify.register(jwt, {
     secret,

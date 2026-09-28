@@ -13,6 +13,11 @@ import {
   toPaginatedResponse,
 } from '../../utils/pagination';
 import { getAllowedClientOrigins } from '../../config/auth';
+import {
+  encodeStreamCursor,
+  getStreamMaxMs,
+  resolveStreamStart,
+} from '../../utils/sseCursor';
 
 const respond = async (
   request: FastifyRequest,
@@ -51,14 +56,18 @@ export const markNotificationRead = (
   (request.params as { id: string }).id,
 ));
 
+/** Every event carries the resume id, so the client always knows where it is. */
 const writeEvent = (
   reply: FastifyReply,
   event: string,
   payload: unknown,
+  id?: string,
 ): void => {
-  reply.raw.write(`event: ${event}\n`);
-  reply.raw.write(`data: ${JSON.stringify(payload)}\n\n`);
+  reply.raw.write(`${id ? `id: ${id}\n` : ''}event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
 };
+
+const singleHeader = (value: string | string[] | undefined): string | undefined =>
+  Array.isArray(value) ? value[0] : value;
 
 export const streamNotifications = (
   request: FastifyRequest,
@@ -81,21 +90,31 @@ export const streamNotifications = (
   reply.raw.setHeader('Connection', 'keep-alive');
   reply.raw.setHeader('X-Accel-Buffering', 'no');
   reply.raw.flushHeaders();
-  reply.raw.write('retry: 3000\n\n');
+  reply.raw.write('retry: 1000\n\n');
 
   const service = new NotificationsService(request.server);
-  let cursorCreatedAt = new Date().toISOString();
-  let cursorId = '';
-  let stockCursorCreatedAt = cursorCreatedAt;
-  let stockCursorId = '';
+  // Resume after the last event the client saw (Last-Event-ID), else from now.
+  const start = resolveStreamStart(singleHeader(request.headers['last-event-id']));
+  let cursorCreatedAt = start.cursor.notifications.createdAt;
+  let cursorId = start.cursor.notifications.id;
+  let stockCursorCreatedAt = start.cursor.stock.createdAt;
+  let stockCursorId = start.cursor.stock.id;
   let polling = false;
   let closed = false;
   const canReceiveStockSignals = permissionRequirementSatisfied(
     request.user,
     PERMISSION_CODE.SUPPLY_ORDER_CREATE,
   );
+  const currentId = () => encodeStreamCursor({
+    notifications: { createdAt: cursorCreatedAt, id: cursorId },
+    stock: { createdAt: stockCursorCreatedAt, id: stockCursorId },
+  });
 
-  writeEvent(reply, 'connected', { connected_at: cursorCreatedAt });
+  writeEvent(reply, 'connected', {
+    connected_at: new Date().toISOString(),
+    // false: the client may have missed events and should refetch its lists.
+    resumed: start.resumed,
+  }, currentId());
 
   const poll = async () => {
     if (closed || polling) return;
@@ -109,9 +128,9 @@ export const streamNotifications = (
       for (const signal of signals) {
         if (closed) break;
         const { cursor_id: cursorIdForRow, ...payload } = signal;
-        writeEvent(reply, 'notification', payload);
         cursorCreatedAt = signal.created_at;
         cursorId = cursorIdForRow;
+        writeEvent(reply, 'notification', payload, currentId());
       }
       if (canReceiveStockSignals && !closed) {
         const stockChange = await service.getLatestStockChange(
@@ -125,7 +144,7 @@ export const streamNotifications = (
             domain: NOTIFICATION_DOMAIN.SUPPLY,
             type: 'STOCK_CHANGED',
             occurred_at: stockChange.created_at,
-          });
+          }, currentId());
         }
       }
     } catch (error) {
@@ -143,6 +162,22 @@ export const streamNotifications = (
   const accessTokenExpiryTimer = setTimeout(() => {
     if (!closed) reply.raw.end();
   }, Math.max(0, request.user.exp * 1000 - Date.now()));
+  // End cleanly before the Netlify proxy's 26-second cut: the client reconnects
+  // at once with the id of the last event and misses nothing. A last poll runs
+  // first so nothing that arrived since the previous tick waits a whole cycle.
+  const maxMs = getStreamMaxMs();
+  const lifetimeTimer = maxMs > 0
+    ? setTimeout(() => {
+      void (async () => {
+        while (polling && !closed) await new Promise((resolve) => setTimeout(resolve, 50));
+        await poll();
+        if (!closed) {
+          writeEvent(reply, 'reconnect', { reason: 'max_duration' }, currentId());
+          reply.raw.end();
+        }
+      })();
+    }, maxMs)
+    : null;
 
   const cleanup = () => {
     if (closed) return;
@@ -150,6 +185,7 @@ export const streamNotifications = (
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
     clearTimeout(accessTokenExpiryTimer);
+    if (lifetimeTimer) clearTimeout(lifetimeTimer);
   };
   request.raw.once('close', cleanup);
   reply.raw.once('close', cleanup);

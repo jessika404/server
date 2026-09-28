@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { getAuthConfiguration, isAllowedClientOrigin } from '../config/auth';
+import { resolveClientIp } from '../utils/clientIp';
 
 const REFRESH_SECRET_BYTES = 32;
 const SESSION_TOKEN_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43,})$/i;
@@ -292,7 +293,7 @@ export const authSessionMetadata = (
   request: FastifyRequest,
 ): { userAgent?: string; ipAddress?: string } => ({
   userAgent: request.headers['user-agent'],
-  ipAddress: request.ip,
+  ipAddress: resolveClientIp(request),
 });
 
 export const __authSessionInternals = {

@@ -6,12 +6,18 @@ import '../../src/plugins/dbContext';
 import {
   __authSessionInternals,
 } from '../../src/services/auth-sessions.service';
+import { createHmac } from 'node:crypto';
 import {
+  assertAuthConfiguration,
   getAllowedClientOrigins,
   getAuthConfiguration,
   isAllowedClientOrigin,
 } from '../../src/config/auth';
 import { getTrustProxyOption } from '../../src/config/server';
+import {
+  isValidNetlifySignature,
+  resolveClientIp,
+} from '../../src/utils/clientIp';
 
 const migrationPath = 'supabase/migrations/20260908020510_auth_sessions.sql';
 const reusePath = 'supabase/migrations/20260915040212_auth_session_reuse_detection.sql';
@@ -25,6 +31,10 @@ const trackedEnv = [
   'APP_REFRESH_TOKEN_TTL_DAYS',
   'APP_REFRESH_COOKIE_SECURE',
   'APP_REFRESH_COOKIE_SAME_SITE',
+  'APP_REFRESH_COOKIE_PATH',
+  'APP_REFRESH_COOKIE_DOMAIN',
+  'APP_JWT_SECRET',
+  'NETLIFY_PROXY_SIGNATURE_SECRET',
   'APP_REFRESH_REUSE_GRACE_SECONDS',
   'TRUST_PROXY',
 ] as const;
@@ -98,8 +108,56 @@ describe('AUTH Phase 1 session hardening', () => {
     const cookie = getAuthConfiguration().refreshCookieOptions;
     assert.equal(cookie.httpOnly, true);
     assert.equal(cookie.secure, true);
-    assert.equal(cookie.sameSite, 'none');
-    assert.equal(cookie.path, '/auth');
+    // Same origin through the /api proxy: first-party Lax cookie on the public path.
+    assert.equal(cookie.sameSite, 'lax');
+    assert.equal(cookie.path, '/api/auth');
+    assert.equal(cookie.domain, undefined);
+    assert.equal(cookie.maxAge, 30 * 24 * 60 * 60, 'Max-Age in seconds');
+  });
+
+  it('configures the cookie path per environment and refuses a Domain', () => {
+    delete process.env.NODE_ENV;
+    delete process.env.APP_REFRESH_COOKIE_SECURE;
+    delete process.env.APP_REFRESH_COOKIE_SAME_SITE;
+    const local = getAuthConfiguration().refreshCookieOptions;
+    assert.deepEqual(
+      { path: local.path, secure: local.secure, sameSite: local.sameSite, httpOnly: local.httpOnly },
+      { path: '/api/auth', secure: false, sameSite: 'lax', httpOnly: true },
+    );
+    process.env.APP_REFRESH_COOKIE_PATH = '/';
+    assert.equal(getAuthConfiguration().refreshCookieOptions.path, '/');
+    process.env.APP_REFRESH_COOKIE_PATH = 'api/auth';
+    assert.throws(() => getAuthConfiguration(), /absolute path/);
+    delete process.env.APP_REFRESH_COOKIE_PATH;
+    process.env.APP_REFRESH_COOKIE_DOMAIN = 'netlify.app';
+    assert.throws(() => getAuthConfiguration(), /host-only/);
+    delete process.env.APP_REFRESH_COOKIE_DOMAIN;
+    process.env.APP_REFRESH_COOKIE_SAME_SITE = 'none';
+    assert.throws(() => getAuthConfiguration(), /require APP_REFRESH_COOKIE_SECURE=true/);
+  });
+
+  it('stops the boot when an auth setting is missing or inconsistent', () => {
+    process.env.APP_JWT_SECRET = 'x'.repeat(40);
+    process.env.ORIGIN_URL = 'https://edc.netlify.app';
+    delete process.env.CLIENT_ORIGINS;
+    process.env.NODE_ENV = 'production';
+    delete process.env.APP_REFRESH_COOKIE_SECURE;
+    assert.equal(assertAuthConfiguration().refreshCookieOptions.secure, true);
+
+    process.env.APP_REFRESH_COOKIE_SECURE = 'false';
+    assert.throws(() => assertAuthConfiguration(), /Secure refresh cookie/);
+    delete process.env.APP_REFRESH_COOKIE_SECURE;
+    delete process.env.ORIGIN_URL;
+    assert.throws(() => assertAuthConfiguration(), /ORIGIN_URL is required/);
+    process.env.ORIGIN_URL = 'https://edc.netlify.app';
+    process.env.APP_JWT_SECRET = 'short';
+    assert.throws(() => assertAuthConfiguration(), /APP_JWT_SECRET/);
+    process.env.CLIENT_ORIGINS = '*';
+    assert.throws(() => getAllowedClientOrigins());
+
+    const plugin = read('src/plugins/jwt.ts');
+    assert.match(plugin, /const config = assertAuthConfiguration\(\);/);
+    assert.match(plugin, /NETLIFY_PROXY_SIGNATURE_SECRET is required in production/);
   });
 
   it('exposes login, refresh and idempotent logout with login rate limiting', () => {
@@ -252,6 +310,44 @@ describe('AUTH Phase 2 refresh token reuse detection', () => {
     assert.equal(getTrustProxyOption(), true);
     process.env.TRUST_PROXY = '0';
     assert.throws(() => getTrustProxyOption(), /1 or greater/);
+  });
+
+  it('takes the client IP from Netlify only on a request Netlify signed', () => {
+    const secret = 's'.repeat(40);
+    const now = Math.floor(Date.now() / 1000);
+    const sign = (payload: Record<string, unknown>, key = secret, alg = 'HS256') => {
+      const head = Buffer.from(JSON.stringify({ alg, typ: 'JWT' })).toString('base64url');
+      const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+      const signature = createHmac('sha256', key).update(`${head}.${body}`).digest('base64url');
+      return `${head}.${body}.${signature}`;
+    };
+    const valid = sign({ iss: 'netlify', exp: now + 60, site_url: 'https://edc.netlify.app' });
+    assert.equal(isValidNetlifySignature(valid, secret), true);
+    assert.equal(isValidNetlifySignature(sign({ iss: 'netlify', exp: now - 1 }), secret), false, 'expired');
+    assert.equal(isValidNetlifySignature(sign({ iss: 'other', exp: now + 60 }), secret), false, 'issuer');
+    assert.equal(isValidNetlifySignature(sign({ iss: 'netlify', exp: now + 60 }, 'k'.repeat(40)), secret), false, 'key');
+    assert.equal(isValidNetlifySignature(sign({ iss: 'netlify', exp: now + 60 }, secret, 'none'), secret), false, 'alg');
+    assert.equal(isValidNetlifySignature('a.b', secret), false);
+
+    const request = (headers: Record<string, string>) =>
+      ({ ip: '10.0.0.7', headers }) as never;
+    // Signed by Netlify: one bucket per real user.
+    assert.equal(resolveClientIp(request({ 'x-nf-sign': valid, 'x-nf-client-connection-ip': '203.0.113.9' }), secret), '203.0.113.9');
+    assert.equal(resolveClientIp(request({ 'x-nf-sign': valid, 'x-nf-client-connection-ip': '2001:db8::1' }), secret), '2001:db8::1');
+    // Unsigned or forged: the header is ignored, the connecting address is used.
+    assert.equal(resolveClientIp(request({ 'x-nf-client-connection-ip': '203.0.113.9' }), secret), '10.0.0.7');
+    assert.equal(resolveClientIp(request({ 'x-nf-sign': 'forged.token.value', 'x-nf-client-connection-ip': '203.0.113.9' }), secret), '10.0.0.7');
+    assert.equal(resolveClientIp(request({ 'x-nf-sign': valid, 'x-nf-client-connection-ip': 'not-an-ip' }), secret), '10.0.0.7');
+    assert.equal(resolveClientIp(request({ 'x-nf-sign': valid, 'x-nf-client-connection-ip': '203.0.113.9' }), null), '10.0.0.7');
+
+    process.env.NETLIFY_PROXY_SIGNATURE_SECRET = 'short';
+    assert.throws(() => resolveClientIp(request({})), /at least 32/);
+  });
+
+  it('keys rate limits and session audit rows on the resolved client IP', () => {
+    assert.match(read('src/plugins/rate-limit.ts'), /keyGenerator: \(request\) => resolveClientIp\(request\)/);
+    assert.match(read('src/services/auth-sessions.service.ts'), /ipAddress: resolveClientIp\(request\)/);
+    assert.doesNotMatch(read('src/services/auth-sessions.service.ts'), /ipAddress: request\.ip/);
   });
 
   it('wires trustProxy into the options fastify-cli actually reads', () => {

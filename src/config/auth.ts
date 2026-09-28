@@ -4,6 +4,13 @@ const DEFAULT_ACCESS_TTL = '30m';
 const DEFAULT_REFRESH_TTL_DAYS = 30;
 const DEFAULT_COOKIE_NAME = 'vf_refresh_token';
 const DEFAULT_REFRESH_REUSE_GRACE_SECONDS = 30;
+/**
+ * The public path of the auth routes as the browser sees it. The API is served
+ * under /api (Netlify proxy in production, Vite proxy locally) and the prefix is
+ * stripped before Fastify, so the cookie path must name the public path or the
+ * browser will never send it to /api/auth/refresh.
+ */
+const DEFAULT_REFRESH_COOKIE_PATH = '/api/auth';
 
 const parseBoolean = (value: string | undefined, fallback: boolean): boolean => {
   if (value === undefined || value.trim() === '') return fallback;
@@ -42,8 +49,8 @@ const parseSameSite = (
   value: string | undefined,
   secure: boolean,
 ): CookieSerializeOptions['sameSite'] => {
-  const normalized = value?.trim().toLowerCase();
-  const sameSite = normalized || (secure ? 'none' : 'lax');
+  // Same-origin through the proxy: Lax is enough and keeps the cookie first-party.
+  const sameSite = value?.trim().toLowerCase() || 'lax';
   if (!['lax', 'strict', 'none'].includes(sameSite)) {
     throw new Error('APP_REFRESH_COOKIE_SAME_SITE must be lax, strict or none');
   }
@@ -78,6 +85,14 @@ export const isAllowedClientOrigin = (origin: string | undefined): boolean => {
   return getAllowedClientOrigins().includes(origin);
 };
 
+const parseCookiePath = (value: string | undefined): string => {
+  const path = value?.trim() || DEFAULT_REFRESH_COOKIE_PATH;
+  if (!path.startsWith('/') || /[;,\s]/.test(path)) {
+    throw new Error('APP_REFRESH_COOKIE_PATH must be an absolute path such as /api/auth');
+  }
+  return path;
+};
+
 export interface AuthConfiguration {
   accessTokenTtl: string;
   issuer: string;
@@ -92,7 +107,11 @@ export const getAuthConfiguration = (): AuthConfiguration => {
   const production = process.env.NODE_ENV === 'production';
   const secure = parseBoolean(process.env.APP_REFRESH_COOKIE_SECURE, production);
   const refreshTokenTtlSeconds = parseRefreshTtlDays() * 24 * 60 * 60;
-  const domain = process.env.APP_REFRESH_COOKIE_DOMAIN?.trim() || undefined;
+  // A Domain attribute would widen the cookie to sibling hosts; the proxy makes
+  // it unnecessary, so a leftover value is a configuration error.
+  if (process.env.APP_REFRESH_COOKIE_DOMAIN?.trim()) {
+    throw new Error('APP_REFRESH_COOKIE_DOMAIN is not supported: the refresh cookie is host-only');
+  }
 
   return {
     accessTokenTtl: process.env.APP_JWT_ACCESS_TTL?.trim() || DEFAULT_ACCESS_TTL,
@@ -105,9 +124,29 @@ export const getAuthConfiguration = (): AuthConfiguration => {
       httpOnly: true,
       secure,
       sameSite: parseSameSite(process.env.APP_REFRESH_COOKIE_SAME_SITE, secure),
-      path: '/auth',
+      path: parseCookiePath(process.env.APP_REFRESH_COOKIE_PATH),
+      // Seconds (Max-Age), as @fastify/cookie serialises it.
       maxAge: refreshTokenTtlSeconds,
-      ...(domain ? { domain } : {}),
     },
   };
+};
+
+/**
+ * Called once at startup: every auth setting is read and checked, and a missing
+ * or inconsistent one stops the process instead of failing each refresh later.
+ */
+export const assertAuthConfiguration = (): AuthConfiguration => {
+  const secret = process.env.APP_JWT_SECRET;
+  if (!secret || secret.length < 32) {
+    throw new Error('APP_JWT_SECRET must contain at least 32 characters');
+  }
+  if (!process.env.ORIGIN_URL?.trim()) {
+    throw new Error('ORIGIN_URL is required: it is the only origin allowed to refresh or log out');
+  }
+  const origins = getAllowedClientOrigins();
+  const config = getAuthConfiguration();
+  if (origins.some((origin) => origin.startsWith('https:')) && !config.refreshCookieOptions.secure) {
+    throw new Error('An https ORIGIN_URL needs a Secure refresh cookie (APP_REFRESH_COOKIE_SECURE=true or NODE_ENV=production)');
+  }
+  return config;
 };

@@ -10,8 +10,12 @@ import {
   notificationReadSchema,
   notificationStreamSchema,
 } from '../../schemas/notifications';
+import { getStreamMaxMs } from '../../utils/sseCursor';
 
 const notificationRoutes: FastifyPluginAsync = async (fastify) => {
+  // Validate NOTIFICATION_STREAM_MAX_SECONDS at boot, not on the first stream.
+  getStreamMaxMs();
+
   fastify.get('/', {
     preHandler: [verifyToken],
     schema: notificationListSchema,
